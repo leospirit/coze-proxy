@@ -2,13 +2,15 @@
   "name": "coze-proxy",
   "version": "1.0.0",
   "description": "WeChat Mini Program proxy for Coze bot",
-  "main": "api/chat.js",
+  "main": "server.js",
   "license": "MIT",
   "type": "module",
   "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
     "node-fetch": "^3.3.2"
   },
   "scripts": {
-    "start": "node api/chat.js"
+    "start": "node server.js"
   }
 }
