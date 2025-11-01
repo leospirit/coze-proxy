@@ -5,6 +5,9 @@
   "main": "server.js",
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=18.x"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
