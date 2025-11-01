@@ -2,8 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 
-// === 环境变量，从 Render 的 Environment 里来 ===
-const COZE_API_HOST = 'https://api.coze.cn'; // 如果你的 bot 在 coze.com，请改成 https://api.coze.com
+// === 环境变量（Render 上配置的） ===
+const COZE_API_HOST = 'https://api.coze.cn'; // 如果你之后用 coze.com 机器人，改成 https://api.coze.com
 const COZE_BOT_ID   = process.env.COZE_BOT_ID;
 const COZE_TOKEN    = process.env.COZE_TOKEN;
 
@@ -15,77 +15,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/**
- * 轮询 Coze，直到有真正的机器人回答
- * 传入的是 conversation_id
- */
-async function waitForAnswer(conversationId) {
-  const maxTries = 20;   // 最多问20次
-  const delayMs  = 500;  // 每次等0.5秒
-
-  for (let i = 0; i < maxTries; i++) {
-    const resp = await fetch(`${COZE_API_HOST}/v3/chat/retrieve_messages`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${COZE_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        conversation_id: conversationId, // 关键字段：conversation_id
-      })
-    });
-
-    const data = await resp.json();
-    console.log('[POLL]', i, JSON.stringify(data).slice(0, 400));
-
-    // 如果 Coze 报错，比如 code=4001，直接返回错误信息
-    if (typeof data.code !== 'undefined' && data.code !== 0) {
-      return { answer: `（Coze 返回错误 ${data.code}：${data.msg || '未知错误'}）` };
-    }
-
-    // 判断状态是否完成
-    if (
-      data.status === 'completed' ||
-      data.status === 'succeeded' ||
-      data.status === 'success'   ||
-      data.status === 'done'
-    ) {
-      // 从 messages 里找到机器人说的话
-      let answerText = '';
-
-      if (Array.isArray(data.messages)) {
-        const botMsg = data.messages.find(
-          m =>
-            m.role === 'assistant' &&
-            typeof m.content === 'string' &&
-            m.content.trim() !== ''
-        );
-        if (botMsg) {
-          answerText = botMsg.content;
-        }
-      }
-
-      if (!answerText) {
-        answerText = '（没有拿到assistant回复）';
-      }
-
-      return { answer: answerText };
-    }
-
-    // 还在生成中 -> 等一会再问
-    await new Promise(r => setTimeout(r, delayMs));
-  }
-
-  // 超时
-  return { answer: '（等待超时，稍后再试）' };
-}
-
-// === 健康检查，浏览器/微信后台可以直接 GET 看服务活没活 ===
+// 健康检查
 app.get('/', (req, res) => {
   res.json({ status: 'ok', time: Date.now() });
 });
 
-// === 这个就是给你小程序用的聊天接口 ===
+/**
+ * 小程序会 POST /api/chat
+ * body = { "message": "你好，介绍一下你自己" }
+ * 我们转发给 Coze 的同步对话接口，拿到最终回答后直接返回。
+ */
 app.post('/api/chat', async (req, res) => {
   const { user_id, message } = req.body || {};
 
@@ -94,8 +33,22 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    // 第一步：向 Coze 发起对话请求
-    const createResp = await fetch(`${COZE_API_HOST}/v3/chat`, {
+    // 这里我们调用“同步问答（completion-style）”接口。
+    // 不再自己轮询，不再用 retrieve_messages。
+    //
+    // 注意：以下路径 /v3/chat/completions 是基于 Coze 的
+    // 同步生成式接口命名习惯。如果你部署后依然报
+    // “does not exist”，把这个路径最后一段改成
+    // /v3/chat 或 /v3/chat/message 之类的并观察日志。
+    //
+    // 我们会把请求打印到 Render 日志里，方便定位。
+    console.log('[REQ] send to Coze /v3/chat/completions:', {
+      bot_id: COZE_BOT_ID,
+      user_id: user_id || 'wx_user_001',
+      content_preview: message.slice(0, 30)
+    });
+
+    const cozeResp = await fetch(`${COZE_API_HOST}/v3/chat/completions`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${COZE_TOKEN}`,
@@ -103,46 +56,57 @@ app.post('/api/chat', async (req, res) => {
       },
       body: JSON.stringify({
         bot_id: COZE_BOT_ID,
-        user_id: user_id || 'wx_user_001', // 之后可以换成真实 openid 之类
-        additional_messages: [
+        user_id: user_id || 'wx_user_001',
+        // Coze 标准问答输入往往是 messages 数组，role=user/content=你的提问
+        messages: [
           {
             role: 'user',
             content: message,
-            content_type: 'text',
           }
         ],
-        stream: false // 我们用整块式，方便小程序一次拿到
+        // 我们只要最终结果，不要流式
+        stream: false
       })
     });
 
-    const createData = await createResp.json();
-    console.log('[CREATE]', JSON.stringify(createData).slice(0, 400));
+    const data = await cozeResp.json();
+    console.log('[COZE RAW COMPLETION]', JSON.stringify(data).slice(0, 400));
 
-    // 从返回里拿会话ID（优先 conversation_id）
-    const conversationId =
-      createData?.data?.conversation_id ||
-      createData?.conversation_id ||
-      createData?.data?.id ||
-      createData?.id ||
-      createData?.chat_id;
+    // 我们尝试多种常见位置去拿回答文本
+    let answerText = '';
 
-    if (!conversationId) {
-      console.log('[ERROR] 没拿到 conversationId');
-      return res.json({ answer: '（无法获取任务ID）' });
+    // 1. OpenAI-style: data.choices[0].message.content
+    if (
+      data.choices &&
+      Array.isArray(data.choices) &&
+      data.choices[0] &&
+      data.choices[0].message &&
+      typeof data.choices[0].message.content === 'string'
+    ) {
+      answerText = data.choices[0].message.content;
     }
 
-    // 第二步：轮询，直到 Coze 真正给出 assistant 回复
-    const finalResult = await waitForAnswer(conversationId);
+    // 2. 部分 Coze 返回 data.messages 数组（兼容兜底）
+    if (!answerText && Array.isArray(data.messages)) {
+      const botMsg = data.messages.find(m => m.role === 'assistant' && m.content);
+      if (botMsg) {
+        answerText = botMsg.content;
+      }
+    }
 
-    // 返回给前端 / 小程序
-    return res.json(finalResult);
+    if (!answerText) {
+      // 如果还没拿到，就把错误/状态透传出来便于调试
+      answerText = `（Coze 返回了但是没有标准回答，code=${data.code ?? 'NA'} status=${data.status ?? 'NA'}）`;
+    }
+
+    return res.json({ answer: answerText });
   } catch (err) {
     console.error('Coze proxy error:', err);
     return res.status(500).json({ error: 'Coze API failed' });
   }
 });
 
-// === 启动服务（Render 会注入 PORT） ===
+// Render 注入 PORT
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server listening on port ${PORT}`);
